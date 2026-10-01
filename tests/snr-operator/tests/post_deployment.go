@@ -204,6 +204,10 @@ var _ = Describe(
 			Label(labels.TierSmoke, labels.DisruptionNonDestructive,
 				labels.PlatformAny, labels.FrequencyPresubmit,
 				labels.ComponentOLM), func() {
+				if !helpers.IsDownstream() {
+					Skip("CSV product annotations are absent when ECO_IS_DOWNSTREAM=false")
+				}
+
 				By("Checking valid-subscription annotation")
 
 				annotations := snrCSV.Object.Annotations
@@ -241,42 +245,50 @@ var _ = Describe(
 				labels.ComponentOLM), func() {
 				By("Checking required CSV annotations")
 
-				annotations := snrCSV.Object.Annotations
-				Expect(annotations).ToNot(BeNil(), "CSV annotations should not be nil")
+				if !helpers.IsDownstream() {
+					By("Skipping product feature annotations when ECO_IS_DOWNSTREAM=false")
+				} else {
+					annotations := snrCSV.Object.Annotations
+					Expect(annotations).ToNot(BeNil(), "CSV annotations should not be nil")
 
-				var annotationErrors []string
+					var annotationErrors []string
 
-				for annotationKey, expectedValue := range snrparams.RequiredAnnotations {
-					annotationValue, exists := annotations[annotationKey]
-					if !exists {
-						annotationErrors = append(annotationErrors,
-							fmt.Sprintf("required annotation %q is missing", annotationKey))
+					for annotationKey, expectedValue := range snrparams.RequiredAnnotations {
+						annotationValue, exists := annotations[annotationKey]
+						if !exists {
+							annotationErrors = append(annotationErrors,
+								fmt.Sprintf("required annotation %q is missing", annotationKey))
 
-						continue
+							continue
+						}
+
+						if annotationValue != expectedValue {
+							annotationErrors = append(annotationErrors,
+								fmt.Sprintf("annotation %q: expected %q, got %q",
+									annotationKey, expectedValue, annotationValue))
+						}
 					}
 
-					if annotationValue != expectedValue {
-						annotationErrors = append(annotationErrors,
-							fmt.Sprintf("annotation %q: expected %q, got %q",
-								annotationKey, expectedValue, annotationValue))
+					if len(annotationErrors) > 0 {
+						errMsg := "SNR CSV annotation validation failures:\n"
+						for _, msg := range annotationErrors {
+							errMsg += fmt.Sprintf("- %s\n", msg)
+						}
+
+						Fail(errMsg)
 					}
 				}
 
-				if len(annotationErrors) > 0 {
-					errMsg := "SNR CSV annotation validation failures:\n"
-					for _, msg := range annotationErrors {
-						errMsg += fmt.Sprintf("- %s\n", msg)
-					}
+				if helpers.IsDownstream() {
+					By("Checking replaces field")
 
-					Fail(errMsg)
+					replaces := snrCSV.Object.Spec.Replaces
+					Expect(replaces).ToNot(BeEmpty(), "CSV spec.replaces should not be empty")
+					Expect(replaces).To(ContainSubstring(snrparams.CSVNamePattern),
+						"replaces field should contain %q, got %q", snrparams.CSVNamePattern, replaces)
+				} else {
+					By("Skipping replaces field check when ECO_IS_DOWNSTREAM=false")
 				}
-
-				By("Checking replaces field")
-
-				replaces := snrCSV.Object.Spec.Replaces
-				Expect(replaces).ToNot(BeEmpty(), "CSV spec.replaces should not be empty")
-				Expect(replaces).To(ContainSubstring(snrparams.CSVNamePattern),
-					"replaces field should contain %q, got %q", snrparams.CSVNamePattern, replaces)
 
 				By("Checking cluster topology for replica validation")
 

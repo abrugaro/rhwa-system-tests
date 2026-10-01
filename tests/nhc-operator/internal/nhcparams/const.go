@@ -40,6 +40,8 @@ const (
 
 	// SNRTemplateName is the default SNR template name deployed by the operator.
 	SNRTemplateName = "self-node-remediation-automatic-strategy-template"
+	// SNRDaemonSetName is the node-agent DaemonSet that performs self-remediation.
+	SNRDaemonSetName = "self-node-remediation-ds"
 
 	// NHCTestName is the NHC CR name used in remediation trigger tests.
 	// In multi-CR tests, this is the slower/standard-duration NHC.
@@ -62,6 +64,17 @@ const (
 	// SSH is used instead of oc debug for kubelet stop/start because
 	// oc debug cannot schedule pods when kubelet is stopped.
 	SSHTimeout = 30 * time.Second
+
+	// UnhealthyConditionDuration is the standard NHC detection duration.
+	UnhealthyConditionDuration = "30s"
+
+	// OCDebugKubeletStopTimeout is the maximum time to wait for the "oc debug"
+	// kubelet-stop command used.
+	OCDebugKubeletStopTimeout = 5 * time.Minute
+
+	// LeaderAcquisitionTimeout is the maximum time to wait for the NHC
+	// controller's leader-election Lease to point at a pod that exists.
+	LeaderAcquisitionTimeout = 1 * time.Minute
 
 	// NodeNotReadyTimeout is the maximum time to wait for NHC to detect an
 	// unhealthy node and enter Remediating. Includes SSH timeout (30s)
@@ -248,4 +261,11 @@ const (
 	// EscalationWebhookOngoingRemediation is the expected webhook error reason when editing
 	// escalating remediations while remediation is in progress.
 	EscalationWebhookOngoingRemediation = "prohibited due to running remediation"
+
+	// NHCEscalationTestName is the base name for NHC CRs in escalation E2E tests (RHWA-1245).
+	NHCEscalationTestName = "nhc-test-escalation"
+	// EscalationSNRStepTimeout is the SNR step timeout used in escalation E2E tests.
+	EscalationSNRStepTimeout = "180s"
+	// EscalationWaitTimeout is the maximum wait for escalation to occur in E2E tests.
+	EscalationWaitTimeout = 5 * time.Minute
 )

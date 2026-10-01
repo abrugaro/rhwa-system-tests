@@ -108,7 +108,12 @@ var _ = Describe(
 
 			Expect(workerNodes).ToNot(BeEmpty(), "No schedulable worker nodes found")
 
-			targetNodeName = workerNodes[0]
+			// Inject storage faults on a node that does not run the SBR controller: blocking
+			// CephFS on the controller's own node prevents the SBRStorageUnhealthy condition
+			// from being reported, so the test would time out waiting for it.
+			targetNodeName = pickTargetWorkerNode()
+			Expect(targetNodeName).ToNot(BeEmpty(),
+				"No schedulable worker node without an SBR controller pod found")
 			injectorPodName = "sbr-detect-only-injector-" + strings.Map(func(r rune) rune {
 				if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
 					return r
@@ -191,18 +196,109 @@ var _ = Describe(
 
 			By("Creating StorageBasedRemediationConfig with detectOnlyMode: Enabled")
 
+			// Minimum sbrTimeoutSeconds (heartbeat = timeout/2) so a peer marks the
+			// storage-isolated node SBRStorageUnhealthy=True after ~MaxConsecutiveFailures
+			// heartbeats well within StorageInjectionTimeout. The default (30s) leaves too
+			// thin a margin under the injection wait and makes the test flaky.
 			detectOnlySBRC = buildSBRC(sbrparams.SBRCDetectOnlyTestName, map[string]interface{}{
 				"detectOnlyMode":     "Enabled",
 				"sharedStorageClass": rwxStorageClass,
+				"sbrTimeoutSeconds":  int64(sbrparams.SBRCTimeoutSecondsMin),
 			})
 
 			createErr := APIClient.Create(context.TODO(), detectOnlySBRC)
 			Expect(createErr).ToNot(HaveOccurred(),
 				"StorageBasedRemediationConfig with detectOnlyMode: Enabled must be admitted by the API server")
 
-			By("Waiting for agent DaemonSet to become ready with detectOnlyMode: Enabled")
+			By("Waiting for agent DaemonSet pods to be Running with detectOnlyMode: Enabled")
 
-			waitForSBRCReady(sbrparams.SBRCDetectOnlyTestName)
+			// The operator's readiness probe gates on /dev/watchdog existing as a char
+			// device. On IPI-AWS clusters the watchdog kernel module is not loaded, so
+			// pods never become Ready even though detectOnlyMode disarms the watchdog.
+			// Check Running phase instead until the operator relaxes the probe (upstream bug).
+			dsName := sbrparams.SBRAgentDaemonSetPrefix + sbrparams.SBRCDetectOnlyTestName
+
+			Eventually(func() error {
+				agentDS, dsErr := APIClient.DaemonSets(medik8sparams.OperatorNs).Get(
+					context.TODO(), dsName, metav1.GetOptions{})
+				if dsErr != nil {
+					return fmt.Errorf("DaemonSet %s not found: %w", dsName, dsErr)
+				}
+
+				if agentDS.Status.DesiredNumberScheduled == 0 {
+					return fmt.Errorf("DaemonSet %s: no pods scheduled yet", dsName)
+				}
+
+				if agentDS.Status.CurrentNumberScheduled < agentDS.Status.DesiredNumberScheduled {
+					return fmt.Errorf("DaemonSet %s: %d/%d pods scheduled",
+						dsName, agentDS.Status.CurrentNumberScheduled, agentDS.Status.DesiredNumberScheduled)
+				}
+
+				listOpts := metav1.ListOptions{}
+
+				if agentDS.Spec.Selector != nil {
+					sel, selErr := metav1.LabelSelectorAsSelector(agentDS.Spec.Selector)
+					if selErr != nil {
+						return fmt.Errorf("converting DaemonSet selector: %w", selErr)
+					}
+
+					listOpts.LabelSelector = sel.String()
+				}
+
+				podList, podErr := APIClient.CoreV1Interface.Pods(medik8sparams.OperatorNs).List(
+					context.TODO(), listOpts)
+				if podErr != nil {
+					return fmt.Errorf("listing agent pods: %w", podErr)
+				}
+
+				var running int
+
+				for i := range podList.Items {
+					pod := &podList.Items[i]
+
+					if !metav1.IsControlledBy(pod, agentDS) {
+						continue
+					}
+
+					if pod.DeletionTimestamp != nil {
+						continue
+					}
+
+					if pod.Status.Phase != corev1.PodRunning {
+						continue
+					}
+
+					hasRunningContainer := false
+
+					for j := range pod.Status.ContainerStatuses {
+						if pod.Status.ContainerStatuses[j].State.Running != nil {
+							hasRunningContainer = true
+
+							break
+						}
+					}
+
+					if !hasRunningContainer {
+						return fmt.Errorf("pod %s is Running phase but no container has Running state (crash-looping?)",
+							pod.Name)
+					}
+
+					running++
+				}
+
+				if running < int(agentDS.Status.DesiredNumberScheduled) {
+					return fmt.Errorf("DaemonSet %s: %d/%d pods with running containers",
+						dsName, running, agentDS.Status.DesiredNumberScheduled)
+				}
+
+				return nil
+			}, sbrparams.SBRCReadyTimeout, sbrparams.DefaultPollInterval).Should(Succeed(),
+				func() string {
+					return fmt.Sprintf(
+						"SBRC %q agent DaemonSet pods must be Running before detectOnlyMode tests begin\n%s",
+						sbrparams.SBRCDetectOnlyTestName,
+						sbrcReadinessDiagnostics(sbrparams.SBRCDetectOnlyTestName, dsName))
+				})
 		})
 
 		AfterAll(func() {
@@ -445,7 +541,7 @@ var _ = Describe(
 				By(fmt.Sprintf("Creating privileged injector pod on target node %q", targetNodeName))
 
 				injectorPod, createErr := pod.NewBuilder(
-					APIClient, injectorPodName, medik8sparams.OperatorNs, sbrparams.WatchdogDebugImage).
+					APIClient, injectorPodName, medik8sparams.OperatorNs, sbrparams.InjectorImage).
 					DefineOnNode(targetNodeName).
 					WithHostPid(true).
 					WithPrivilegedFlag().

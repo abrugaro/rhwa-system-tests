@@ -43,6 +43,12 @@ var snrGVK = schema.GroupVersionKind{
 	Kind:    "SelfNodeRemediation",
 }
 
+var snrListGVK = schema.GroupVersionKind{
+	Group:   nhcparams.SNRCRDGroup,
+	Version: nhcparams.SNRCRDVersion,
+	Kind:    "SelfNodeRemediationList",
+}
+
 // snrtGVK is the GroupVersionKind for SelfNodeRemediationTemplate CRs.
 var snrtGVK = schema.GroupVersionKind{
 	Group:   nhcparams.SNRCRDGroup,
@@ -100,12 +106,24 @@ func buildNHCForWorkers(name string) *unstructured.Unstructured {
 // by hostname label. Uses minHealthy=0 because a single-node selector with
 // minHealthy=1 blocks remediation entirely (0/1 healthy < 1 required).
 func buildNHCWithHostnameSelector(name, hostname string) *unstructured.Unstructured {
+	return buildNHCWithHostnameSelectorAndTemplate(name, hostname, nhcparams.SNRTemplateName)
+}
+
+// buildNHCWithHostnameSelectorAndTemplate builds a single-node NHC CR using
+// the named SNR template.
+func buildNHCWithHostnameSelectorAndTemplate(name, hostname, templateName string) *unstructured.Unstructured {
 	nhc := buildNHC(name, "", "", map[string]interface{}{
 		"kubernetes.io/hostname": hostname,
 	})
 
 	// Override minHealthy for single-node selector.
 	nhcSpec(nhc)["minHealthy"] = int64(0)
+	nhcSpec(nhc)["remediationTemplate"] = map[string]interface{}{
+		"apiVersion": nhcparams.SNRCRDGroup + "/" + nhcparams.SNRCRDVersion,
+		"kind":       nhcparams.SNRTemplateKind,
+		"name":       templateName,
+		"namespace":  medik8sparams.OperatorNs,
+	}
 
 	return nhc
 }
@@ -181,14 +199,42 @@ func isSNRCRDInstalled(ctx context.Context) bool {
 	return false
 }
 
-// stopKubeletForRemediation stops kubelet on the target node via SSH.
-// SSH is used instead of oc debug because:
+// stopKubeletForRemediation stops kubelet on the target node to trigger
+// remediation. SSH is the default because:
 //   - oc debug can timeout for 5+ minutes on Prow AWS (unreliable)
 //   - SSH is deterministic and fast (~1s via ssh-bastion proxy)
 //   - Matches the Python reference implementation (invoke_ssh_on_the_node)
 //
 // On Prow AWS, SSH traffic is proxied through the ssh-bastion service.
 func stopKubeletForRemediation(ctx context.Context, nodeName string) error {
+	if medik8sparams.KubeletStopViaOCDebug {
+		err := helpers.StopKubelet(
+			ctx, nodeName, nhcparams.OCDebugKubeletStopTimeout, GinkgoWriter.Printf,
+		)
+		if err == nil {
+			return nil
+		}
+
+		// Stopping kubelet kills the debug pod that ran the command, so oc debug
+		// routinely reports failure even when the stop succeeded.
+		// Only propagate the original error when the node
+		// is still Ready, which means the kubelet did not actually stop.
+		if waitErr := helpers.WaitForNodeNotReady(
+			ctx, APIClient, nodeName, nhcparams.DefaultPollInterval,
+			nhcparams.NodeNotReadyTimeout, GinkgoWriter.Printf,
+		); waitErr == nil {
+			GinkgoWriter.Printf(
+				"oc debug reported an error on %s but the node is NotReady, "+
+					"continuing (oc debug error: %v)\n",
+				nodeName, err,
+			)
+
+			return nil
+		}
+
+		return err
+	}
+
 	return helpers.StopKubeletSSH(ctx, APIClient, nodeName, nhcparams.SSHTimeout)
 }
 
@@ -220,10 +266,40 @@ func cleanupNHCCR(ctx context.Context, name string) {
 // cleanupSNRCR safely deletes a SelfNodeRemediation CR by name.
 // SNR CRs are namespaced in the operator namespace.
 func cleanupSNRCR(ctx context.Context, name string) {
-	helpers.DeleteRemediationCR(
-		ctx, APIClient, snrGVK, name, medik8sparams.OperatorNs,
-		nhcparams.DefaultPollInterval, nhcparams.RemediationCRDeletionTimeout,
-		GinkgoWriter.Printf)
+	items, err := listSNRCRsForNode(ctx, name)
+	if err != nil {
+		GinkgoWriter.Printf("cleanupSNRCR: failed to list SNR CRs for %s: %v\n", name, err)
+
+		return
+	}
+
+	for i := range items {
+		helpers.DeleteRemediationCR(
+			ctx, APIClient, snrGVK, items[i].GetName(), medik8sparams.OperatorNs,
+			nhcparams.DefaultPollInterval, nhcparams.RemediationCRDeletionTimeout,
+			GinkgoWriter.Printf)
+	}
+}
+
+func listSNRCRsForNode(ctx context.Context, nodeName string) ([]unstructured.Unstructured, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(snrListGVK)
+
+	if err := APIClient.List(ctx, list, client.InNamespace(medik8sparams.OperatorNs)); err != nil {
+		return nil, fmt.Errorf("list SNR CRs: %w", err)
+	}
+
+	items := make([]unstructured.Unstructured, 0, 1)
+
+	for i := range list.Items {
+		item := list.Items[i]
+		if item.GetName() == nodeName ||
+			item.GetAnnotations()["remediation.medik8s.io/node-name"] == nodeName {
+			items = append(items, item)
+		}
+	}
+
+	return items, nil
 }
 
 // getNHCPhase returns the current .status.phase of the named NHC CR.
@@ -317,55 +393,49 @@ func waitForNHCPhase(ctx context.Context, name, expectedPhase string, timeout ti
 // waitForSNRRemediationComplete polls until the SNR remediation cycle finishes
 // for the given node: SNR CR deleted + boot ID changed.
 func waitForSNRRemediationComplete(
-	ctx context.Context, nodeName, previousBootID string, timeout time.Duration,
+	ctx context.Context, nodeName, previousBootID string,
 ) error {
 	var snrSeen bool
 
 	return wait.PollUntilContextTimeout(
-		ctx, nhcparams.DestructivePollInterval, timeout, true,
+		ctx, nhcparams.DestructivePollInterval, nhcparams.RemediationCompletionTimeout, true,
 		func(ctx context.Context) (bool, error) {
-			obj := &unstructured.Unstructured{}
-			obj.SetGroupVersionKind(snrGVK)
+			items, err := listSNRCRsForNode(ctx, nodeName)
+			if err != nil {
+				return false, err
+			}
 
-			err := APIClient.Get(ctx, types.NamespacedName{
-				Name:      nodeName,
-				Namespace: medik8sparams.OperatorNs,
-			}, obj)
-
-			switch {
-			case err == nil:
+			if len(items) > 0 {
 				if !snrSeen {
-					GinkgoWriter.Printf("SNR CR %s detected -- remediation in progress\n", nodeName)
+					GinkgoWriter.Printf(
+						"SNR CR %s detected for node %s -- remediation in progress\n",
+						items[0].GetName(), nodeName)
 
 					snrSeen = true
 				}
 
 				return false, nil
+			}
 
-			case k8serrors.IsNotFound(err):
-				// SNR CR gone. Check if boot ID changed (node rebooted).
-				currentBootID, bootErr := helpers.GetNodeBootIDFromAPI(ctx, APIClient, nodeName)
-				if bootErr != nil {
-					return false, nil
-				}
-
-				if currentBootID != previousBootID {
-					if snrSeen {
-						GinkgoWriter.Printf("SNR remediation complete: boot ID changed for %s\n", nodeName)
-					} else {
-						GinkgoWriter.Printf(
-							"SNR CR already gone, boot ID changed -- "+
-								"remediation completed before observation for %s\n", nodeName)
-					}
-
-					return true, nil
-				}
-
-				return false, nil
-
-			default:
+			// SNR CR gone. Check if boot ID changed (node rebooted).
+			currentBootID, bootErr := helpers.GetNodeBootIDFromAPI(ctx, APIClient, nodeName)
+			if bootErr != nil {
 				return false, nil
 			}
+
+			if currentBootID != previousBootID {
+				if snrSeen {
+					GinkgoWriter.Printf("SNR remediation complete: boot ID changed for %s\n", nodeName)
+				} else {
+					GinkgoWriter.Printf(
+						"SNR CR already gone, boot ID changed -- "+
+							"remediation completed before observation for %s\n", nodeName)
+				}
+
+				return true, nil
+			}
+
+			return false, nil
 		},
 	)
 }
@@ -949,6 +1019,14 @@ func deleteMultiTemplate(ctx context.Context, name string) {
 	if err := APIClient.Delete(ctx, tmpl); err != nil && !k8serrors.IsNotFound(err) {
 		GinkgoWriter.Printf("WARNING: failed to delete MultiTemplateRemediationTemplate %q: %v\n", name, err)
 	}
+}
+
+// cleanupTestRemediationCR safely deletes a TestRemediation CR by name.
+func cleanupTestRemediationCR(ctx context.Context, name string) {
+	helpers.DeleteRemediationCR(
+		ctx, APIClient, testRemediationGVK, name, "",
+		nhcparams.DefaultPollInterval, nhcparams.RemediationCRDeletionTimeout,
+		GinkgoWriter.Printf)
 }
 
 // testRemediationCRExists checks if a TestRemediation CR exists for the given node.
