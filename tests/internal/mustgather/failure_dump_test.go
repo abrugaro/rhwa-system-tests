@@ -36,17 +36,17 @@ func TestPodNamesFromGetWide(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			got := podNamesFromGetWide(tc.out)
-			if len(got) != len(tc.want) {
-				t.Fatalf("got %v, want %v", got, tc.want)
+			got := podNamesFromGetWide(testCase.out)
+			if len(got) != len(testCase.want) {
+				t.Fatalf("got %v, want %v", got, testCase.want)
 			}
 
-			for idx := range tc.want {
-				if got[idx] != tc.want[idx] {
-					t.Fatalf("got %v, want %v", got, tc.want)
+			for idx := range testCase.want {
+				if got[idx] != testCase.want[idx] {
+					t.Fatalf("got %v, want %v", got, testCase.want)
 				}
 			}
 		})

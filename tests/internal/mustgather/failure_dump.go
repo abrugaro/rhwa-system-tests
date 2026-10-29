@@ -116,6 +116,14 @@ func dumpGatherNamespace(
 		return
 	}
 
+	dumpGatherPodDetails(ctx, diagDir, namespace, safeNS, podsOut, logf)
+}
+
+func dumpGatherPodDetails(
+	ctx context.Context,
+	diagDir, namespace, safeNS, podsOut string,
+	logf func(format string, args ...interface{}),
+) {
 	podNames := podNamesFromGetWide(podsOut)
 	if len(podNames) == 0 {
 		logf("failure dump: skipping pod describe/logs for %s (no pod names)\n", namespace)
